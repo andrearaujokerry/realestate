@@ -2,6 +2,8 @@
 
 Three ways to build the system described in the [requirements doc](<../../LinkedIn Job-Change Lead Engine — Requirements.pdf>) (Oct 3, 2026). All three meet the same requirements. They differ in where business logic lives, what runs the pipeline, and how many moving parts you have to operate.
 
+> **Decision (Oct 3, 2026): Design B.** The build plan is in the [workplan](../workplan.md). It estimates the MVP bottom-up at ~76 engineer-days, with Gate 1 around week 10 for two engineers. That's longer than the top-down figures below, which were only meant for comparing the designs.
+
 | | [A · Postgres-as-Backend](design-a-postgres-as-backend.md) | [B · Typed Monolith](design-b-typed-monolith.md) | [C · Two Planes](design-c-two-planes.md) |
 |---|---|---|---|
 | Thesis | The database is the backend | One TypeScript app with durable jobs (the spec's stack) | The pipeline is its own data product |

@@ -2,6 +2,8 @@
 
 > **Thesis:** one TypeScript codebase and one deployable, typed from the database schema to the lead card. The application server owns the logic, Postgres row-level security enforces tenancy beneath it, and Inngest makes the pipeline durable. This is the stack the spec recommends, worked out in detail.
 
+**Status:** selected on Oct 3, 2026. The [workplan](../workplan.md) lays out how to build it.
+
 This is one of three [design options](README.md). Decisions all three share are documented there and not repeated here.
 
 ## Stack
@@ -131,7 +133,7 @@ The daily digest is an Inngest cron job per tenant (INT-4). The public privacy-r
 | **Infra total** | **~60–200** |
 | LLM ([cost model](README.md#llm-cost-model)) | ~50–65 |
 
-About 4–6 weeks to the Phase 1 gate, which matches the spec's own estimate for this stack.
+The spec's top-down estimate is 4–6 weeks to the Phase 1 gate. The bottom-up [workplan](../workplan.md) puts it at about 10 weeks for two engineers, including a two-week pilot.
 
 ## Risks
 
