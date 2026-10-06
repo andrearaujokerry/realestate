@@ -2,9 +2,9 @@
 
 > **Thesis:** one TypeScript codebase and one deployable, typed from the database schema to the lead card. The application server owns the logic, Postgres row-level security enforces tenancy beneath it, and Inngest makes the pipeline durable. This is the stack the spec recommends, worked out in detail.
 
-**Status:** selected on Oct 3, 2026. The [workplan](../workplan.md) lays out how to build it.
+**Status:** selected on Oct 3, 2026. The [workplan](../workplan.md) lays out how to build it. Ingestion was revised to manual paste on Oct 6, 2026.
 
-This is one of three [design options](README.md). Decisions all three share are documented there and not repeated here.
+This is one of three [design options](README.md). Decisions all three share are documented there and not repeated here, including how [manual-paste ingestion](README.md#ingestion-manual-paste) works.
 
 ## Stack
 
@@ -14,33 +14,33 @@ This is one of three [design options](README.md). Decisions all three share are 
 | Database | Neon Postgres with PostGIS and pg_trgm; Drizzle ORM for queries, migrations and RLS policies |
 | Background work | Inngest durable functions, served by the same app at `/api/inngest` |
 | Auth | Better Auth (magic link, TOTP, organizations), or WorkOS if brokerages require SAML SSO |
-| Secrets | Source credentials envelope-encrypted in Postgres under a KMS key; the only secret in the platform's env store is the KMS credential |
+| Ingest | Paste page. The segmenter is one TypeScript module shared by browser and server; the `ingest.segment` and `ingest.submit` tRPC procedures |
+| Secrets | API keys in Vercel's encrypted environment settings. There are no source credentials, so there's no KMS envelope encryption |
 | Frontend | First page of cards rendered on the server; client components for the feed (TanStack Query and Virtual) and the map (MapLibre, Supercluster); URL state via `nuqs` |
 | Email, Slack | Resend or Postmark; Slack incoming webhooks |
 
-**Variant:** Supabase can host the database instead of Neon. You keep this design's TypeScript-first shape, but use Supabase Auth instead of an auth library. The new-leads pill also gets pushed updates instead of polling.
+**Variant:** Supabase can host the database instead of Neon. You keep this design's TypeScript-first shape, but use Supabase Auth instead of an auth library. The new-leads pill and paste progress also get pushed updates instead of polling.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-  BR["Browser"]
+  BR["Browser<br/>paste box · segmenter"]
   subgraph vercel["Vercel · one Next.js deployable"]
-    APP["UI + tRPC API<br/>tenant-scoped transactions"]
-    FN["Pipeline functions<br/>adapters · Claude · enrich · score · deliver"]
+    APP["UI + tRPC API<br/>paste intake · tenant-scoped transactions"]
+    FN["Pipeline functions<br/>Claude · enrich · score · deliver"]
   end
-  ING["Inngest<br/>cron · throttle · retries · fan-out"]
+  ING["Inngest<br/>retries · concurrency · fan-out"]
   DB[("Neon Postgres + PostGIS<br/>RLS")]
-  KMS["KMS"]
-  EXT["Sources · Claude API · CRM · email · Slack"]
+  EXT["Claude API · CRM · email · Slack"]
 
   BR --> APP
   APP --> DB
   APP -- "events" --> ING
   ING -- "invokes steps" --> FN
   FN --> DB
-  FN -. "decrypt one credential" .-> KMS
   FN <--> EXT
+  APP -- "segmenter fallback" --> EXT
   EXT -- "CRM webhooks" --> APP
 ```
 
@@ -49,28 +49,33 @@ flowchart LR
 The pipeline is a module inside the app, `src/pipeline`, which Inngest invokes. Each stage is a function triggered by an event, and each external call is a `step.run`. Inngest saves each completed step's result, so when a step fails it retries that step rather than the whole job.
 
 ```ts
-// Sketch. One fetch per run, so throttling runs is the same as throttling requests.
-export const fetchItem = inngest.createFunction(
+// Sketch. One run per pasted post. The per-tenant cap keeps a 500-post paste from flooding the model APIs.
+export const interpretPost = inngest.createFunction(
   {
-    id: "fetch-item",
-    throttle: { key: "event.data.sourceKey", limit: 60, period: "1m" }, // paces requests per source
-    cancelOn: [{ event: "source/disabled", match: "data.sourceKey" }], // SRC-5: disabling drops queued work
-    retries: 4,                                                         // exponential backoff between attempts
+    id: "interpret-post",
+    concurrency: { key: "event.data.tenantId", limit: 10 },
+    retries: 4, // exponential backoff between attempts
   },
-  { event: "source/item.discovered" },
+  { event: "raw/stored" },
   async ({ event, step }) => {
-    await step.run("take-budget", () => takeBudget(event.data.sourceKey)); // hard per-minute and per-day cap (ING-8)
-    const raw = await step.run("fetch", () => adapterFor(event.data).fetch(event.data.item));
-    await step.run("store-raw", () => storeRawPost(raw));                    // ON CONFLICT DO NOTHING
+    const gate = await step.run("regex-gate", () => regexGate(event.data.rawPostId));
+    if (!gate.passed) return;
+    const verdict = await step.run("classify", () => classify(event.data.rawPostId)); // Haiku 4.5
+    if (!verdict.isJobChange) return; // below the floor: dropped and logged (EXT-4)
+    const records = await step.run("extract", () => extract(event.data.rawPostId)); // Sonnet, structured output
+    await step.run("enrich-and-score", () => assembleLeads(records));
   },
 );
 ```
 
-- **Schedule.** An Inngest cron function runs every 15 minutes. It emits `source/run.requested` for each (tenant, source) pair that is due (ING-6).
-- **Discover, fetch, store.** Discovery pages through the adapter from its stored cursor and emits one `source/item.discovered` event per candidate.
-  - **Budgets** (ING-8). Inngest's throttle paces the fetches. The hard cap is the Postgres counter behind `takeBudget`, and discovery requests count against it too.
-  - **Backoff and breaker** (ING-9). The HTTP wrapper backs off on a 429 or 403 and counts consecutive failures in `source_health`. The third failure trips the breaker. That emits `source/disabled` for the pair, which cancels its queued fetches, marks the run `halted` and alerts an admin.
-- **Interpret.** A `raw/stored` event runs gate → classify → extract → enrich → score as steps of one function. When volume spikes, `batchEvents` groups classifier calls.
+- **Paste and preview.** The Ingest page reads the clipboard's text and HTML and runs the segmenter in the browser, so the preview appears instantly. When the rules can't split a paste, `ingest.segment` asks Haiku for line ranges. You fix any mis-split posts and submit.
+- **Store.** `ingest.submit` writes the `source_runs` row and the raw posts in one transaction (ING-7, ING-11, ING-12, PRIV-5):
+  - each post is keyed on its activity id or content hash, with `ON CONFLICT DO NOTHING`
+  - suppressed people are dropped before the insert
+
+  After the transaction commits, it sends one `raw/stored` event per new post.
+- **Interpret.** A `raw/stored` event runs gate → classify → extract → enrich → score as steps of one function (sketch above).
+- **Progress.** Each paste's counts in `source_runs` update as its posts move through. The Ingest page polls them every few seconds (ING-15).
 - **Failures.** Each function's `onFailure` handler writes to `dead_letters`. The admin retry button re-sends the original event (ING-14).
 - **Re-extraction** (EXT-8) is an admin action. It emits `extract/requested` for every raw post still inside retention, tagged with the new extractor version. A concurrency cap keeps the backfill from crowding out live traffic.
 - **Rescoring** (SCO-3, SCO-4) walks a tenant's leads 1,000 at a time and calls the same pure `score()` function the live pipeline uses. It writes a `score_audit` row for each score that changes.
@@ -104,7 +109,7 @@ Use Neon's WebSocket (pooled) driver. Its HTTP driver can't hold the interactive
 - **Protected-field exclusion.** `ScoringInput` is a strict Zod schema with only the allowed fields. A lint rule stops the scoring module from importing the database layer, so it only ever sees what `toScoringInput()` hands it. A unit test fails if anyone adds a field.
 - **Audit** (AUD-1). A middleware records view, export, edit and delete events.
 - **Export** (SEC-4) is its own permissioned procedure. It logs the row count and filter, re-checks suppression (INT-8), and streams the CSV.
-- **Credentials** (SRC-6, SEC-7). Each (tenant, source) credential is a ciphertext row. The fetch step uses KMS to decrypt only the credential it needs. Rotating a credential is a row update.
+- **Who can paste.** `ingest.submit` accepts admins by default, or agents too if the tenant setting allows it. A paste is capped at 500 posts.
 
 ## Dashboard
 
@@ -112,6 +117,7 @@ Use Neon's WebSocket (pooled) driver. Its HTTP driver can't hold the interactive
 - The first 25 cards render on the server and stream with the HTML, which helps meet the 2.5-second interactive target. After that, TanStack Query handles infinite scroll with keyset cursors (FEED-3).
 - Filters live in the URL through `nuqs` (MAP-9). Saved views store the same serialized filter (UI-2).
 - The new-leads pill polls `leads.newSince({ filters, since })` every 60 seconds. That's a cheap count served from an index (FEED-11).
+- The Ingest page has the paste box, the preview table, and live counts for each paste.
 
 ## Integrations
 
@@ -131,25 +137,26 @@ The daily digest is an Inngest cron job per tenant (INT-4). The public privacy-r
 | Auth (Better Auth runs in the app; WorkOS SSO costs extra per connection) | 0+ |
 | Email | 0–20 |
 | **Infra total** | **~60–200** |
-| LLM ([cost model](README.md#llm-cost-model)) | ~50–65 |
+| LLM ([cost model](README.md#llm-cost-model)) | ~15 |
 
-The spec's top-down estimate is 4–6 weeks to the Phase 1 gate. The bottom-up [workplan](../workplan.md) puts it at about 10 weeks for two engineers, including a two-week pilot.
+The spec's top-down estimate is 4–6 weeks to the Phase 1 gate. The bottom-up [workplan](../workplan.md) puts it at about 9 weeks for two engineers, including a two-week pilot.
 
 ## Risks
 
 | Risk | Mitigation |
 |---|---|
 | A query escapes the tenant transaction | Non-owner role with FORCE RLS; root client can't be imported; cross-tenant tests in CI |
-| An Inngest outage stalls the pipeline | Steps are idempotent and resume on recovery. With a 6-hour target and a 24-hour freshness limit, an hour-long outage costs nothing visible. Inngest can be self-hosted if outages become a pattern |
-| Serverless time limits | Every network call is its own step; no step makes more than one fetch or one model call |
+| An Inngest outage stalls the pipeline | Steps are idempotent and resume on recovery. Pastes wait in the raw store, so an outage delays leads but loses nothing. Inngest can be self-hosted if outages become a pattern |
+| Serverless time limits | Every model call is its own step; no step makes more than one |
+| LinkedIn changes its page layout, and the segmenter's rules stop splitting cleanly | The Haiku fallback; the preview shows every split before anything is stored; fixture tests built from real pastes run in CI |
 | Vendor sprawl | Hold it to four: Vercel, Neon, Inngest, email. Auth runs inside the app |
 | Weak person matching in TypeScript | Start with deterministic keys plus trigram similarity. If person-dedup precision misses its target on the golden set, that's the signal to move the pipeline toward Design C |
 
 ## Pros
 
 - **It's the spec's own pick.** Its stack table, phase estimates and non-choices apply unchanged, so there's nothing to re-argue.
-- **One language, types end to end.** A schema change shows up as a compile error in the card that renders it. Logic is plain TypeScript, which is easy to unit-test and review.
-- **Inngest covers most of the pipeline plumbing:** per-source throttling, cron, step-level retries with backoff, cancellation when a source is disabled, failure handlers and run history.
+- **One language, types end to end.** A schema change shows up as a compile error in the card that renders it. Logic is plain TypeScript, which is easy to unit-test and review. The segmenter is one module, shared by the browser preview and the server.
+- **Inngest covers the pipeline plumbing:** step-level retries with backoff, per-tenant concurrency caps, failure handlers and run history.
 - **Two layers of tenant protection.** Authorization reads as TypeScript middleware, and RLS still catches a mistake.
 - **The easiest to hire for and hand off.** Neon can give each pull request its own branch of the database for rehearsing migrations and backfills.
 
@@ -157,7 +164,7 @@ The spec's top-down estimate is 4–6 weeks to the Phase 1 gate. The bottom-up [
 
 - **More vendors.** Vercel, Neon, Inngest, auth and email mean more bills, more dashboards and more failure points. Inngest sits in the path of every pipeline step.
 - **Tenant context depends on discipline.** One query on the wrong client skips it. The mitigations work, but they're conventions and tests, not structure.
-- **Serverless shapes the code.** Work has to be chopped into short steps. That's mostly healthy, but awkward for long pagination and large exports.
+- **Serverless shapes the code.** Work has to be chopped into short steps. That's mostly healthy, but awkward for large exports.
 - **TypeScript has thin tooling for data work.** Person matching, company matching and evaluation analysis need more hand-rolled code.
 - **More code than A** for the same features: an API layer, auth wiring, and polling instead of push.
 
